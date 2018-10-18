@@ -17,18 +17,26 @@ import (
 	"github.com/elastic/hey-apm/compose"
 )
 
+const defaultUserAgent = "hey-apm/v2"
+
 var (
+	// run options
+	runTimeout   = flag.Duration("run", 10*time.Second, "stop run after this duration")
+	restDuration = flag.Duration("rest-duration", 100*time.Millisecond, "how long to stop sending data")
+	restInterval = flag.Duration("rest-interval", 500*time.Millisecond, "how often to stop sending data")
+
+	// payload options
+	numAgents = flag.Int("c", 3, "concurrent clients")
+	numFrames = flag.Int("f", 1, "number of stacktrace frames per span")
+	numSpans  = flag.Int("s", 1, "number of spans")
+
+	// http options
 	baseUrl            = flag.String("base-url", "http://localhost:8200", "apm-server url")
-	runTimeout         = flag.Duration("run", 10*time.Second, "stop run after this duration")
+	requestTimeout     = flag.Duration("request-timeout", 10*time.Second, "request timeout")
+	idleTimeout        = flag.Duration("idle-timeout", 3*time.Minute, "idle timeout")
 	disableCompression = flag.Bool("disable-compression", false, "")
 	disableKeepAlives  = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
-	numSpans           = flag.Int("s", 1, "number of spans")
-	numFrames          = flag.Int("f", 1, "number of stacktrace frames per span")
-	numAgents          = flag.Int("c", 3, "concurrent clients")
-
-	restDuration = flag.Duration("rest-duration", 100*time.Millisecond, "how long to stop sending data")
-	restInterval = flag.Duration("rest-interval", 500*time.Millisecond, "how often to stop sending data")
 )
 
 func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte) {
@@ -49,6 +57,7 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 			logger.Println("[error] writing metadata: ", err)
 			return
 		} else {
+			logger.Println("[debug] wrote metadata")
 			writes++
 			wrote += n
 		}
@@ -68,6 +77,7 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 						logger.Println("[error] writing payload: ", err)
 						return
 					} else {
+						logger.Println("[debug] wrote payload", string(p))
 						writes++
 						wrote += n
 					}
@@ -84,6 +94,10 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 	req.Header.Add("Content-Type", "application/x-ndjson")
 	if !*disableCompression {
 		req.Header.Add("Content-Encoding", "gzip")
+	}
+	// Use the defaultUserAgent unless the Header contains one, which may be blank to not send the header.
+	if _, ok := req.Header["User-Agent"]; !ok {
+		req.Header.Add("User-Agent", defaultUserAgent)
 	}
 	rsp, err := client.Do(req)
 	cancel()
@@ -117,12 +131,15 @@ func main() {
 	flag.Parse()
 	ctx, _ := context.WithTimeout(context.Background(), *runTimeout)
 	tr := &http.Transport{
-		MaxIdleConns:       10,
-		IdleConnTimeout:    10 * time.Minute,
-		DisableCompression: *disableCompression,
-		DisableKeepAlives:  *disableKeepAlives,
+		MaxIdleConnsPerHost: 1,
+		IdleConnTimeout:     *idleTimeout,
+		DisableCompression:  *disableCompression,
+		DisableKeepAlives:   *disableKeepAlives,
 	}
-	client := &http.Client{Transport: tr}
+	client := &http.Client{
+		Timeout:   *requestTimeout,
+		Transport: tr,
+	}
 	if *disableRedirects {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -142,6 +159,7 @@ func main() {
 		logger := log.New(os.Stderr, fmt.Sprintf("[agent %d] ", i), log.Ldate|log.Ltime|log.Lshortfile)
 
 		go func() {
+			logger.Println("[debug] starting new connection")
 			do(ctx, logger, client, payloads)
 			wg.Done()
 		}()
