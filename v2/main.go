@@ -41,13 +41,19 @@ var (
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 )
 
-func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte, transactions int) {
+type result struct {
+	writes       int // payloads
+	wrote        int // bytes
+	transactions int
+	response     *http.Response
+}
+
+func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte, transactions int) result {
 	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
 
 	doneWriting := make(chan struct{})
-	writes := 0 // payloads
-	wrote := 0  // bytes
+	r := result{}
 	go func(w io.WriteCloser) {
 		defer close(doneWriting)
 		var b = w
@@ -60,11 +66,11 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 			logger.Println("[error] writing metadata: ", err)
 			return
 		} else {
-			writes++
-			wrote += n
+			r.writes++
+			r.wrote += n
 		}
 		rest := time.After(*restInterval)
-		for t := 0; t < transactions; t++ {
+		for ; r.transactions < transactions; r.transactions++ {
 			for _, p := range payloads {
 				select {
 				case <-ctx.Done():
@@ -77,8 +83,8 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 						logger.Println("[error] writing payload: ", err)
 						return
 					} else {
-						writes++
-						wrote += n
+						r.writes++
+						r.wrote += n
 					}
 				}
 			}
@@ -88,7 +94,7 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/intake/v2/events", *baseUrl), reader)
 	if err != nil {
 		logger.Println("[error] creating request:", err)
-		return
+		return r
 	}
 	req.Header.Add("Content-Type", "application/x-ndjson")
 	if !*disableCompression {
@@ -98,15 +104,14 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 	if _, ok := req.Header["User-Agent"]; !ok {
 		req.Header.Add("User-Agent", defaultUserAgent)
 	}
-	rsp, err := client.Do(req)
+	r.response, err = client.Do(req)
 	cancel()
 	if err != nil {
 		logger.Println("[error] http client:", err)
-		return
+		return r
 	}
 	<-doneWriting
-	rspBody, _ := ioutil.ReadAll(rsp.Body)
-	logger.Printf("[info] after %d writes totaling %d bytes: %s %s\n", writes, wrote, rsp.Status, string(rspBody))
+	return r
 }
 
 func singleTransaction() []byte {
@@ -165,7 +170,11 @@ func main() {
 
 		go func(countT int) {
 			logger.Println("[debug] starting new connection")
-			do(ctx, logger, client, payloads, countT)
+			result := do(ctx, logger, client, payloads, countT)
+			rspBody, _ := ioutil.ReadAll(result.response.Body)
+			result.response.Body.Close()
+			logger.Printf("[info] reported %d transactions with %d writes totaling %d bytes: %d %s\n",
+				result.transactions, result.writes, result.wrote, result.response.StatusCode, string(rspBody))
 			wg.Done()
 		}(agentT + extraT)
 		extraT = 0
