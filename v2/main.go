@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sync"
@@ -26,9 +27,10 @@ var (
 	restInterval = flag.Duration("rest-interval", 500*time.Millisecond, "how often to stop sending data")
 
 	// payload options
-	numAgents = flag.Int("c", 3, "concurrent clients")
-	numFrames = flag.Int("f", 1, "number of stacktrace frames per span")
-	numSpans  = flag.Int("s", 1, "number of spans")
+	numAgents       = flag.Int("c", 3, "concurrent clients")
+	numFrames       = flag.Int("f", 1, "number of stacktrace frames per span")
+	numSpans        = flag.Int("s", 1, "number of spans")
+	numTransactions = flag.Int("t", math.MaxInt64, "number of transactions")
 
 	// http options
 	baseUrl            = flag.String("base-url", "http://localhost:8200", "apm-server url")
@@ -39,7 +41,7 @@ var (
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 )
 
-func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte) {
+func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte, transactions int) {
 	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
 
@@ -47,27 +49,25 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 	writes := 0 // payloads
 	wrote := 0  // bytes
 	go func(w io.WriteCloser) {
+		defer close(doneWriting)
 		var b = w
 		if !*disableCompression {
 			defer w.Close()
 			b = gzip.NewWriter(w)
+			defer b.Close()
 		}
-		defer close(doneWriting)
 		if n, err := b.Write(addNewline(compose.Metadata)); err != nil {
 			logger.Println("[error] writing metadata: ", err)
 			return
 		} else {
-			logger.Println("[debug] wrote metadata")
 			writes++
 			wrote += n
 		}
 		rest := time.After(*restInterval)
-		for {
+		for t := 0; t < transactions; t++ {
 			for _, p := range payloads {
 				select {
 				case <-ctx.Done():
-					//logger.Println("[debug] all done")
-					b.Close()
 					return
 				case <-rest:
 					time.Sleep(*restDuration)
@@ -77,7 +77,6 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 						logger.Println("[error] writing payload: ", err)
 						return
 					} else {
-						logger.Println("[debug] wrote payload", string(p))
 						writes++
 						wrote += n
 					}
@@ -154,15 +153,22 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
+	extraT := *numTransactions % *numAgents
+	agentT := *numTransactions / *numAgents
+	if agentT == 0 {
+		log.Printf("[warn] not enough transactions (%d) to go around to %d agents", *numTransactions, *numAgents)
+		*numAgents = 1
+	}
 	wg.Add(*numAgents)
 	for i := 0; i < *numAgents; i++ {
 		logger := log.New(os.Stderr, fmt.Sprintf("[agent %d] ", i), log.Ldate|log.Ltime|log.Lshortfile)
 
-		go func() {
+		go func(countT int) {
 			logger.Println("[debug] starting new connection")
-			do(ctx, logger, client, payloads)
+			do(ctx, logger, client, payloads, countT)
 			wg.Done()
-		}()
+		}(agentT + extraT)
+		extraT = 0
 	}
 	wg.Wait()
 }
