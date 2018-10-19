@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/elastic/hey-apm/compose"
+	"github.com/pkg/errors"
 )
 
 const defaultUserAgent = "hey-apm/v2"
@@ -25,6 +26,8 @@ var (
 	runTimeout   = flag.Duration("run", 10*time.Second, "stop run after this duration")
 	restDuration = flag.Duration("rest-duration", 100*time.Millisecond, "how long to stop sending data")
 	restInterval = flag.Duration("rest-interval", 500*time.Millisecond, "how often to stop sending data")
+	connDuration = flag.Duration("conn-duration", 10*time.Second,
+		"how long to hold open a connection to apm-server (API_REQUEST_TIME).")
 
 	// payload options
 	numAgents       = flag.Int("c", 3, "concurrent clients")
@@ -34,7 +37,7 @@ var (
 
 	// http options
 	baseUrl            = flag.String("base-url", "http://localhost:8200", "apm-server url")
-	requestTimeout     = flag.Duration("request-timeout", 10*time.Second, "request timeout")
+	requestTimeout     = flag.Duration("request-timeout", 30*time.Second, "request timeout")
 	idleTimeout        = flag.Duration("idle-timeout", 3*time.Minute, "idle timeout")
 	disableCompression = flag.Bool("disable-compression", false, "")
 	disableKeepAlives  = flag.Bool("disable-keepalive", false, "")
@@ -48,7 +51,7 @@ type result struct {
 	response     *http.Response
 }
 
-func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte, transactions int) result {
+func do(parent context.Context, logger *log.Logger, client *http.Client, payloads [][]byte, transactions int) (result, error) {
 	ctx, cancel := context.WithCancel(parent)
 	reader, writer := io.Pipe()
 
@@ -56,9 +59,9 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 	r := result{}
 	go func(w io.WriteCloser) {
 		defer close(doneWriting)
+		defer w.Close()
 		var b = w
 		if !*disableCompression {
-			defer w.Close()
 			b = gzip.NewWriter(w)
 			defer b.Close()
 		}
@@ -74,8 +77,10 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 			for _, p := range payloads {
 				select {
 				case <-ctx.Done():
+					//logger.Println("[debug] done writing payloads")
 					return
 				case <-rest:
+					//logger.Println("[debug] resting")
 					time.Sleep(*restDuration)
 					rest = time.After(*restInterval)
 				default:
@@ -83,6 +88,7 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 						logger.Println("[error] writing payload: ", err)
 						return
 					} else {
+						//logger.Println("[debug] wrote payload")
 						r.writes++
 						r.wrote += n
 					}
@@ -93,8 +99,7 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 
 	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/intake/v2/events", *baseUrl), reader)
 	if err != nil {
-		logger.Println("[error] creating request:", err)
-		return r
+		return r, errors.Wrap(err, "creating request")
 	}
 	req.Header.Add("Content-Type", "application/x-ndjson")
 	if !*disableCompression {
@@ -105,13 +110,13 @@ func do(parent context.Context, logger *log.Logger, client *http.Client, payload
 		req.Header.Add("User-Agent", defaultUserAgent)
 	}
 	r.response, err = client.Do(req)
+	logger.Println("request complete")
 	cancel()
 	if err != nil {
-		logger.Println("[error] http client:", err)
-		return r
+		return r, errors.Wrap(err, "http client")
 	}
 	<-doneWriting
-	return r
+	return r, nil
 }
 
 func singleTransaction() []byte {
@@ -169,13 +174,23 @@ func main() {
 		logger := log.New(os.Stderr, fmt.Sprintf("[agent %d] ", i), log.Ldate|log.Ltime|log.Lshortfile)
 
 		go func(countT int) {
-			logger.Println("[debug] starting new connection")
-			result := do(ctx, logger, client, payloads, countT)
-			rspBody, _ := ioutil.ReadAll(result.response.Body)
-			result.response.Body.Close()
-			logger.Printf("[info] reported %d transactions with %d writes totaling %d bytes: %d %s\n",
-				result.transactions, result.writes, result.wrote, result.response.StatusCode, string(rspBody))
-			wg.Done()
+			defer wg.Done()
+			for countT > 0 && ctx.Err() == nil {
+				logger.Println("[debug] starting new connection")
+				connCtx, cancel := context.WithTimeout(ctx, *connDuration)
+				result, err := do(connCtx, logger, client, payloads, countT)
+				msg := fmt.Sprintf("reported %d transactions with %d writes totaling %d bytes",
+					result.transactions, result.writes, result.wrote)
+				cancel()
+				if err != nil {
+					logger.Printf("[error] %s: %s", msg, err)
+					return
+				}
+				rspBody, _ := ioutil.ReadAll(result.response.Body)
+				result.response.Body.Close()
+				logger.Printf("[info] %s: %d %s", msg, result.response.StatusCode, string(rspBody))
+				countT -= result.transactions
+			}
 		}(agentT + extraT)
 		extraT = 0
 	}
